@@ -1,0 +1,24 @@
+[versions]
+kotlinx-logger = "3.0.0"
+koin = "4.2.2"
+clikt = "5.1.0"
+tomlkt = "0.6.1"
+snakeyaml = "2.5"
+r8 = "9.5.32"
+junit = "5.13.4"
+
+[plugins]
+jreleaser = { id = "org.jreleaser", version = "1.25.0" }
+
+[libraries]
+kotlinx-logger = { module = "kim.jade:kotlinx-logger", version.ref = "kotlinx-logger" }
+kotlinx-logger-integration-koin = { module = "kim.jade:kotlinx-logger-integration-koin", version.ref = "kotlinx-logger" }
+kotlinx-logger-integration-jvm = { module = "kim.jade:kotlinx-logger-integration-jvm", version.ref = "kotlinx-logger" }
+koin-core = { module = "io.insert-koin:koin-core", version.ref = "koin" }
+clikt-core = { module = "com.github.ajalt.clikt:clikt-core", version.ref = "clikt" }
+tomlkt = { module = "dev.eav.tomlkt:tomlkt", version.ref = "tomlkt" }
+snakeyaml = { module = "org.yaml:snakeyaml", version.ref = "snakeyaml" }
+r8 = { module = "com.android.tools:r8", version.ref = "r8" }
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
