@@ -1,0 +1,10 @@
+[catalog]
+source = "config/products.txt"
+refresh-interval = "30s"
+
+[health]
+interval = "10s"
+
+[server]
+host = "127.0.0.1"
+port = 8080
