@@ -5,14 +5,17 @@ import kim.jade.chassis.ApplicationStatus
 import kim.jade.chassis.ShutdownTimeoutException
 import kim.jade.chassis.hook.HookPhase
 import kim.jade.chassis.hook.onRelease
+import kim.jade.chassis.hook.onRequestStop
 import kim.jade.chassis.hook.onStart
 import kim.jade.chassis.hook.onStop
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -22,14 +25,17 @@ import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
+import org.koin.core.KoinApplication
 import org.koin.core.module.Module
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
+import kotlin.coroutines.ContinuationInterceptor
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -63,8 +69,27 @@ class WorkerTest {
         shutdownTimeout: Duration = 30.seconds,
     ): Application {
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val options = module { single { WorkerOptions(graceful = graceful, context = dispatcher) } }
+        val options = module { single { WorkerOptions(graceful = graceful) } }
         return Application(modules.toList() + options, shutdownTimeout = shutdownTimeout, context = dispatcher)
+    }
+
+    @Test fun `worker modules compose without overriding bindings`() {
+        val recording = module { worker { Recording(calls) {} } }
+        val stoppable = module { worker { Stoppable("stoppable", calls) } }
+
+        val app = KoinApplication.init()
+        try {
+            app.allowOverride(false)
+            app.modules(recording, stoppable)
+            val recordingWorker = app.koin.get<Recording>(named<Recording>())
+            val stoppableWorker = app.koin.get<Stoppable>(named<Stoppable>())
+            val workers = app.koin.getAll<Worker>()
+            assertEquals(2, workers.size)
+            assertEquals(setOf(recordingWorker, stoppableWorker), workers.toSet())
+            assertSame(recordingWorker, app.koin.get<Worker>(named<Recording>()))
+        } finally {
+            app.close()
+        }
     }
 
     @Test fun `workers start in Started after every Start hook`() = runTest {
@@ -76,6 +101,28 @@ class WorkerTest {
         advanceUntilIdle()
         assertEquals(listOf("start", "run"), calls)
         app.stop()
+    }
+
+    @Test fun `workers inherit the application coroutine context by default`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val marker = ThreadLocal<String>()
+        val observed = CompletableDeferred<Pair<ContinuationInterceptor?, String?>>()
+        val app = Application(
+            listOf(module {
+                worker {
+                    Recording(calls) {
+                        observed.complete(currentCoroutineContext()[ContinuationInterceptor] to marker.get())
+                    }
+                }
+            }),
+            context = dispatcher + marker.asContextElement("application"),
+        )
+        try {
+            app.start()
+            assertEquals(dispatcher to "application", observed.await())
+        } finally {
+            app.stop()
+        }
     }
 
     @Test fun `a worker that ends on RequestStop is not cancelled`() = runTest {
@@ -263,22 +310,52 @@ class WorkerTest {
         assertEquals(ticksAtTermination, ticks)
     }
 
-    @Test fun `a job in the worker context is neither used nor cancelled`() = runTest {
-        val callerJob = Job()
-        val dispatcher = StandardTestDispatcher(testScheduler)
-        val app = Application(
-            listOf(module {
-                worker { Recording(calls) { awaitCancellation() } }
-                single { WorkerOptions(graceful = 1.seconds, context = dispatcher + callerJob) }
-            }),
-            context = dispatcher,
+    @Test fun `application shutdown cancels workers when the Stop phase is skipped`() = runTest {
+        val app = application(
+            module {
+                worker {
+                    Recording(calls) {
+                        try { delay(20.seconds) } finally { calls += "worker end" }
+                    }
+                }
+                onRequestStop { delay(10.seconds) }
+            },
+            shutdownTimeout = 1.seconds,
         )
         app.start()
         runCurrent()
-        app.stop()
-        assertEquals(ApplicationStatus.STOPPED, app.status)
-        assertTrue(callerJob.isActive)
-        assertTrue(callerJob.children.none())
-        callerJob.cancel()
+        val thrown = assertFailsWith<ShutdownTimeoutException> { app.stop() }
+        assertEquals(HookPhase.RequestStop, thrown.phase)
+        runCurrent()
+        assertEquals(listOf("run", "worker end"), calls)
+    }
+
+    @Test fun `worker context overrides the dispatcher and ignores its supplied job`() = runTest {
+        val callerJob = Job()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val workerDispatcher = StandardTestDispatcher(testScheduler)
+        val marker = ThreadLocal<String>()
+        val observed = CompletableDeferred<Pair<ContinuationInterceptor?, String?>>()
+        val app = Application(
+            listOf(module {
+                worker {
+                    Recording(calls) {
+                        observed.complete(currentCoroutineContext()[ContinuationInterceptor] to marker.get())
+                        awaitCancellation()
+                    }
+                }
+                single { WorkerOptions(graceful = 1.seconds, context = workerDispatcher + callerJob) }
+            }),
+            context = dispatcher + marker.asContextElement("application"),
+        )
+        try {
+            app.start()
+            assertEquals(workerDispatcher to "application", observed.await())
+            assertTrue(callerJob.children.none())
+        } finally {
+            app.stop()
+            assertTrue(callerJob.isActive)
+            callerJob.cancel()
+        }
     }
 }

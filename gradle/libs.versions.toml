@@ -1,5 +1,5 @@
 [versions]
-kotlinx-logger = "3.0.0"
+kotlinx-logger = "3.0.1"
 koin = "4.2.2"
 clikt = "5.1.0"
 tomlkt = "0.6.1"

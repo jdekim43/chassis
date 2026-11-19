@@ -70,6 +70,59 @@ dependencies {
 Ktor log to the same place. If your application already has an SLF4J provider such as Logback, exclude one of the
 two.
 
+### Log context
+
+Pass shared fields as `logContext` when creating an application.
+
+```kotlin
+import kim.jade.chassis.Application
+import kim.jade.kotlinx.logger.context.LogContext
+
+val app = Application(
+    modules = listOf(storage),
+    name = "catalog",
+    logContext = LogContext("environment" to "production"),
+)
+```
+
+Chassis includes `application` (from the application name by default) and the shared fields in lifecycle,
+CLI, worker, and Ktor logs. The execution scope adds these fields to `LogRecord.context`:
+
+| Scope | Fields |
+| --- | --- |
+| Lifecycle | `fromStatus` and `toStatus` on transitions, `status` on stop requests, `phase` and `hook` when running hooks |
+| CLI invocation | `command` with the command path |
+| Worker | `worker` with the worker name |
+| Ktor | `component` set to `ktor` |
+
+Chassis installs scoped fields in `CoroutineLogContext` at each execution boundary. On the JVM,
+`CoroutineThreadLogContext` exposes the live coroutine fields through `ThreadLogContext` for regular
+functions and ordinary Kotlinx Logger and SLF4J calls. Chassis installs the bridge at each independent
+coroutine root and reuses it when setting up commands and workers in their owning scope.
+Ktor requests inherit the server context. Applications can add request fields such as `requestId`
+through their own Ktor plugins.
+In suspending code, use `currentCoroutineLogContext()` for direct access or the kotlinx-logger DSL when logging.
+
+```kotlin
+import kim.jade.kotlinx.logger.context.withLogContext
+
+withLogContext("operation" to "refresh") {
+    logger.info {
+        withCoroutine()
+        "Catalog refreshed"
+    }
+}
+```
+
+`withLogContext` merges the active coroutine fields by default. The supplied fields take precedence
+for matching keys. Use `merge = false` to replace the coroutine fields for the block. A direct write
+to `ThreadLogContext` takes precedence for ordinary log calls within that thread context.
+`withCoroutine()` merges the coroutine fields last. Structured formatters can read the resulting
+`LogRecord.context`.
+
+Set process-wide fields in `GlobalLogContext` at process startup. For example, `GlobalLogContext["application"]`
+sets a name for logs outside Chassis. Logs inside Chassis use the name of the active `Application` instance by default.
+
 ## Quick start
 
 ```kotlin
@@ -171,7 +224,12 @@ val polling = module {
 }
 ```
 
+- By default, `worker { Poller(get()) }` uses `named<Poller>()` for both the concrete type and its `Worker`
+  binding. Use `get<Poller>(named<Poller>())` for direct lookup. When registering multiple workers of the same
+  type, give each registration a distinct qualifier, such as `worker(named("primary")) { Poller(get()) }`.
 - A worker that fails stops the application with that failure.
+- Workers inherit the application coroutine context, including its dispatcher. Set `WorkerOptions.context` to
+  override individual elements, such as the dispatcher. The application owns the worker scope's job.
 - On stop, workers get `onRequestStop()` and then `WorkerOptions.graceful` (10 seconds by default) to finish.
   Workers still running after that are cancelled.
 
@@ -288,6 +346,7 @@ val catalog = module {
 
 - Feature modules contribute routes and plugins with `ktor { }`. The blocks run when the server starts. An object
   that registers lifecycle hooks cannot be created for the first time inside a block; create it at startup.
+- Pass `coroutineContext` to `ktorServer` to provide Ktor's parent coroutine context. Chassis adds its logging context to it.
 - `autoStart = true` opens the server in the `Start` phase. Leave it off in a CLI application, where every command
   loads every module, and call `KtorServer.start()` from the command that serves:
 

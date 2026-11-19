@@ -20,3 +20,17 @@ inline fun <T> Logger.timed(what: String, block: () -> T): T {
     val stopwatch = Stopwatch()
     return block().also { debug("$what finished in ${stopwatch.lap()}") }
 }
+
+suspend inline fun <T> Logger.timedInCoroutine(what: String, block: () -> T): T {
+    debug {
+        withCoroutine()
+        "$what starting"
+    }
+    val stopwatch = Stopwatch()
+    return block().also {
+        debug {
+            withCoroutine()
+            "$what finished in ${stopwatch.lap()}"
+        }
+    }
+}

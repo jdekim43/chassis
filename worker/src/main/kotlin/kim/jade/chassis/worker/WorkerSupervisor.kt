@@ -3,6 +3,11 @@ package kim.jade.chassis.worker
 import kim.jade.chassis.Application
 import kim.jade.chassis.Stopwatch
 import kim.jade.kotlinx.logger.Logger
+import kim.jade.kotlinx.logger.context.CoroutineLogContext
+import kim.jade.kotlinx.logger.context.CoroutineThreadLogContext
+import kim.jade.kotlinx.logger.context.asCoroutineLogContext
+import kim.jade.kotlinx.logger.context.logContext
+import kim.jade.kotlinx.logger.context.withLogContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
@@ -21,20 +26,37 @@ internal class WorkerSupervisor(
     private val options: WorkerOptions,
 ) {
     private val logger = Logger.named("kim.jade.chassis.worker")
-    private val scope = CoroutineScope(options.context.minusKey(Job) + SupervisorJob())
+    private val scope = run {
+        val applicationContext = application.coroutineContext
+        val context = applicationContext + options.context.minusKey(Job)
+        val thread = context[CoroutineThreadLogContext]?.data?.clone()
+        val bridge = thread?.let(::CoroutineThreadLogContext) ?: CoroutineThreadLogContext(context = null)
+        val logContext = options.context.logContext().plus(other = applicationContext.logContext())
+        CoroutineScope(context + SupervisorJob(applicationContext.job) + logContext.asCoroutineLogContext(bridge))
+    }
 
     fun launch() {
         workers.forEach { worker ->
-            scope.launch(CoroutineName(worker.name)) {
-                logger.info("Worker ${worker.name} started")
+            val logContext = CoroutineLogContext(scope.coroutineContext.logContext() + ("worker" to worker.name))
+            scope.launch(CoroutineName(worker.name) + logContext) {
+                logger.info {
+                    withCoroutine()
+                    "Worker ${worker.name} started"
+                }
                 val running = Stopwatch()
                 try {
                     worker.run()
-                    logger.info("Worker ${worker.name} finished after ${running.lap()}")
+                    logger.info {
+                        withCoroutine()
+                        "Worker ${worker.name} finished after ${running.lap()}"
+                    }
                 } catch (cancelled: CancellationException) {
                     // 아직 active라면 stop()이 아니라 Worker 자신이 취소한 것이다(예: withTimeout 만료).
                     if (!isActive) {
-                        logger.info("Worker ${worker.name} cancelled after ${running.lap()}")
+                        logger.info {
+                            withCoroutine()
+                            "Worker ${worker.name} cancelled after ${running.lap()}"
+                        }
                         throw cancelled
                     }
                     failed(worker, running, IllegalStateException("Worker ${worker.name} cancelled itself", cancelled))
@@ -45,18 +67,28 @@ internal class WorkerSupervisor(
         }
     }
 
-    private fun failed(worker: Worker, running: Stopwatch, failure: Throwable) {
-        logger.error("Worker ${worker.name} failed after ${running.lap()}", exception = failure)
+    private suspend fun failed(worker: Worker, running: Stopwatch, failure: Throwable) {
+        logger.error {
+            withCoroutine()
+            exception(failure)
+            "Worker ${worker.name} failed after ${running.lap()}"
+        }
         application.requestStop(failure, "worker ${worker.name} failed")
     }
 
-    fun requestStop() {
+    suspend fun requestStop() {
         for (worker in workers) {
-            try {
-                worker.onRequestStop()
-            } catch (failure: Exception) {
-                logger.error("Worker ${worker.name} failed on the stop request", exception = failure)
-                application.requestStop(failure)
+            withLogContext("worker" to worker.name) {
+                try {
+                    worker.onRequestStop()
+                } catch (failure: Exception) {
+                    logger.error {
+                        withCoroutine()
+                        exception(failure)
+                        "Worker ${worker.name} failed on the stop request"
+                    }
+                    application.requestStop(failure)
+                }
             }
         }
     }
@@ -65,7 +97,10 @@ internal class WorkerSupervisor(
         try {
             val jobs = scope.coroutineContext.job.children.toList()
             if (withTimeoutOrNull(options.graceful) { jobs.joinAll() } == null) {
-                logger.info("Workers still running after ${options.graceful}; cancelling")
+                logger.info {
+                    withCoroutine()
+                    "Workers still running after ${options.graceful}; cancelling"
+                }
                 scope.cancel()
                 jobs.joinAll()
             }

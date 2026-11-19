@@ -4,7 +4,14 @@ import kim.jade.chassis.Application
 import kim.jade.kotlinx.logger.LogLevel
 import kim.jade.kotlinx.logger.LogRecord
 import kim.jade.kotlinx.logger.Logger
+import kim.jade.kotlinx.logger.context.CoroutineLogContext
+import kim.jade.kotlinx.logger.context.CoroutineThreadLogContext
+import kim.jade.kotlinx.logger.context.LogContext
+import kim.jade.kotlinx.logger.context.MutableLogContext
+import kim.jade.kotlinx.logger.context.ThreadLogContext
+import kim.jade.kotlinx.logger.context.currentCoroutineLogContext
 import kim.jade.kotlinx.logger.pipeline.SinkPipe
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -17,6 +24,7 @@ import org.koin.dsl.module
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 
@@ -33,8 +41,7 @@ class WorkerLoggingTest {
 
     private fun TestScope.application(workers: Module): Application {
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val options = module { single { WorkerOptions(context = dispatcher) } }
-        return Application(listOf(workers, options), context = dispatcher)
+        return Application(listOf(workers), context = dispatcher)
     }
 
     private suspend fun logs(block: suspend () -> Unit): List<LogRecord> {
@@ -50,6 +57,85 @@ class WorkerLoggingTest {
 
     private fun List<LogRecord>.duration(level: LogLevel, prefix: String): Duration =
         Duration.parse(single { it.level == level && it.body.startsWith(prefix) }.body.removePrefix(prefix))
+
+    @Test fun `overlapping workers receive app and worker fields without sharing local log data`() = runTest {
+        val logger = Logger.named("test.worker.context")
+        val firstEntered = CompletableDeferred<Unit>()
+        val secondEntered = CompletableDeferred<Unit>()
+        val records = logs {
+            val workers = module {
+                worker(named("first")) {
+                    Named("first", onStop = { logger.info("sync first stop") }) {
+                        currentCoroutineLogContext()["local"] = "first"
+                        ThreadLogContext["threadLocal"] = "first"
+                        firstEntered.complete(Unit)
+                        secondEntered.await()
+                        logger.info("sync first worker")
+                        logger.info {
+                            withCoroutine()
+                            "first body"
+                        }
+                    }
+                }
+                worker(named("second")) {
+                    Named("second") {
+                        firstEntered.await()
+                        logger.info("sync second worker")
+                        logger.info {
+                            withCoroutine()
+                            "second body"
+                        }
+                        secondEntered.complete(Unit)
+                    }
+                }
+            }
+            val dispatcher = StandardTestDispatcher(testScheduler)
+            val options = module {
+                single {
+                    WorkerOptions(
+                        context = dispatcher + CoroutineLogContext(mapOf("queue" to "jobs")) +
+                            CoroutineThreadLogContext(MutableLogContext("workerThread" to "pool")),
+                    )
+                }
+            }
+            val app = Application(
+                listOf(workers, options),
+                name = "catalog",
+                context = dispatcher,
+                logContext = LogContext("env" to "test"),
+            )
+            app.start()
+            runCurrent()
+            app.stop()
+        }
+
+        val first = records.single { it.body == "first body" }.context
+        val second = records.single { it.body == "second body" }.context
+        assertEquals("first", first["local"])
+        assertNull(second["local"])
+        for ((context, name) in listOf(first to "first", second to "second")) {
+            assertEquals("catalog", context["application"])
+            assertEquals("test", context["env"])
+            assertEquals("jobs", context["queue"])
+            assertEquals(name, context["worker"])
+        }
+        val firstFinished = records.single { it.body.startsWith("Worker first finished after ") }
+        assertEquals("first", firstFinished.context["local"])
+        val firstThread = records.single { it.body == "sync first worker" }.context
+        assertEquals("first", firstThread["worker"])
+        assertEquals("pool", firstThread["workerThread"])
+        assertEquals("first", firstThread["threadLocal"])
+        assertEquals("first", firstThread["local"])
+        val secondThread = records.single { it.body == "sync second worker" }.context
+        assertEquals("second", secondThread["worker"])
+        assertEquals("pool", secondThread["workerThread"])
+        assertNull(secondThread["threadLocal"])
+        assertNull(secondThread["local"])
+        val stopThread = records.single { it.body == "sync first stop" }.context
+        assertEquals("first", stopThread["worker"])
+        assertEquals("catalog", stopThread["application"])
+        assertNull(stopThread["threadLocal"])
+    }
 
     @Test fun `a worker logs how long it ran when it finishes or is cancelled`() = runTest {
         val records = logs {
@@ -90,5 +176,6 @@ class WorkerLoggingTest {
 
         val record = records.single { it.level == LogLevel.ERROR && it.body == "Worker broken failed on the stop request" }
         assertEquals("boom", record.exception?.message)
+        assertEquals("broken", record.context["worker"])
     }
 }

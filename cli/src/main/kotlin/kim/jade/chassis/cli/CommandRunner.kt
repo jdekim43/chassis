@@ -2,8 +2,9 @@ package kim.jade.chassis.cli
 
 import com.github.ajalt.clikt.core.CliktError
 import kim.jade.chassis.Application
-import kim.jade.chassis.timed
+import kim.jade.chassis.timedInCoroutine
 import kim.jade.kotlinx.logger.Logger
+import kim.jade.kotlinx.logger.context.asCoroutineLogContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -21,12 +22,14 @@ internal class CommandRunner(private val application: Application) {
     suspend fun launch() {
         val chain = application.attributes.getOrNull(InvocationChain) ?: return
         val name = chain.last().command.commandName
+        val commandPath = chain.drop(1).joinToString(" ") { it.command.commandName }
+        val logContext = application.logContext + mapOf("command" to commandPath)
         val scope = CoroutineScope(SupervisorJob() + currentCoroutineContext().minusKey(Job))
-        job = scope.launch {
+        job = scope.launch(logContext.asCoroutineLogContext()) {
             var commandFailure: Throwable? = null
             var cancellation: CancellationException? = null
             try {
-                logger.timed("Command $name") { chain.forEach { it.command.run() } }
+                logger.timedInCoroutine("Command $name") { chain.forEach { it.command.run() } }
             } catch (cancelled: CancellationException) {
                 if (isActive) commandFailure = IllegalStateException("Command cancelled itself", cancelled)
                 else cancellation = cancelled
@@ -53,7 +56,11 @@ internal class CommandRunner(private val application: Application) {
                 application.requestStop(reason = "command $name finished")
             } else {
                 if (cause !is CliktError) {
-                    logger.error("Command failed: $name", exception = cause)
+                    logger.error {
+                        withCoroutine()
+                        exception(cause)
+                        "Command failed: $name"
+                    }
                 }
                 application.attributes[CommandFailure] = cause
                 val failed = cause.takeUnless { it is CliktError && it.statusCode == 0 }

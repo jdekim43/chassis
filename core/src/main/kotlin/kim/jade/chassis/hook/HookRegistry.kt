@@ -1,7 +1,8 @@
 package kim.jade.chassis.hook
 
-import kim.jade.chassis.timed
+import kim.jade.chassis.timedInCoroutine
 import kim.jade.kotlinx.logger.Logger
+import kim.jade.kotlinx.logger.context.withLogContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -37,16 +38,22 @@ internal class HookRegistry {
         val ordered = if (phase.isLaunchPhase) snapshot else snapshot.asReversed()
         for (hook in ordered) {
             currentCoroutineContext().ensureActive()
-            try {
-                logger.timed("Hook $phase/${hook.name}") { coroutineScope { hook.block() } }
-            } catch (e: Throwable) {
-                val failure = if (e is CancellationException) {
-                    currentCoroutineContext().ensureActive()
-                    IllegalStateException("Hook $phase/${hook.name} cancelled itself", e)
-                } else e
-                logger.error("Hook failed: $phase/${hook.name}", exception = failure)
-                if (phase.isLaunchPhase) throw failure
-                onShutdownFailure(failure)
+            withLogContext("phase" to phase.name, "hook" to hook.name) {
+                try {
+                    logger.timedInCoroutine("Hook $phase/${hook.name}") { coroutineScope { hook.block() } }
+                } catch (e: Throwable) {
+                    val failure = if (e is CancellationException) {
+                        currentCoroutineContext().ensureActive()
+                        IllegalStateException("Hook $phase/${hook.name} cancelled itself", e)
+                    } else e
+                    logger.error {
+                        withCoroutine()
+                        exception(failure)
+                        "Hook failed: $phase/${hook.name}"
+                    }
+                    if (phase.isLaunchPhase) throw failure
+                    onShutdownFailure(failure)
+                }
             }
         }
     }

@@ -9,7 +9,10 @@ import kim.jade.chassis.Application
 import kim.jade.chassis.ApplicationStatus
 import kim.jade.chassis.runApplication
 import kim.jade.kotlinx.logger.Logger
+import kim.jade.kotlinx.logger.context.CoroutineThreadLogContext
+import kim.jade.kotlinx.logger.context.asCoroutineLogContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withContext
 import org.koin.core.module.Module
 import java.io.IOException
 
@@ -52,7 +55,10 @@ suspend fun runCli(
         } catch (failure: Throwable) {
             return reportOptionFailure(root, failure, "Preparing global options failed")
         }
-        run(root, chain, arguments, options, application())
+        val app = application()
+        withContext(app.logContext.asCoroutineLogContext(CoroutineThreadLogContext(context = null))) {
+            run(root, chain, arguments, options, app)
+        }
     } finally {
         CliLogging.restore()
     }
@@ -105,9 +111,15 @@ private suspend fun run(
     }
 }
 
-private fun reportOptionFailure(root: RootCommand, failure: Throwable, message: String): Int {
+private suspend fun reportOptionFailure(root: RootCommand, failure: Throwable, message: String): Int {
     if (failure is CancellationException) throw failure
-    if (failure !is CliktError) Logger.named("kim.jade.chassis.cli").error(message, exception = failure)
+    if (failure !is CliktError) {
+        Logger.named("kim.jade.chassis.cli").error {
+            withCoroutine()
+            exception(failure)
+            message
+        }
+    }
     return report(root, failure)
 }
 

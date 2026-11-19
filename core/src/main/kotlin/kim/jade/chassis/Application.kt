@@ -4,6 +4,13 @@ import kim.jade.chassis.hook.HookPhase
 import kim.jade.chassis.hook.HookRegistry
 import kim.jade.chassis.hook.runHookBlocks
 import kim.jade.kotlinx.logger.Logger
+import kim.jade.kotlinx.logger.context.CoroutineThreadLogContext
+import kim.jade.kotlinx.logger.context.EmptyLogContext
+import kim.jade.kotlinx.logger.context.GlobalLogContext
+import kim.jade.kotlinx.logger.context.LogContext
+import kim.jade.kotlinx.logger.context.asCoroutineLogContext
+import kim.jade.kotlinx.logger.context.logContext
+import kim.jade.kotlinx.logger.context.withLogContext
 import kim.jade.kotlinx.logger.integration.koin.KoinLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -39,11 +46,20 @@ class Application(
     val name: String = "application",
     val shutdownTimeout: Duration = 30.seconds,
     context: CoroutineContext = Dispatchers.Default,
+    logContext: LogContext = EmptyLogContext,
 ) {
     constructor(vararg modules: Module) : this(modules.toList())
 
+    val logContext: LogContext = LogContext(
+        context.logContext() + ("application" to name) + logContext,
+    )
+
     private val logger = Logger.named(name)
-    private val scope = CoroutineScope(context.minusKey(Job) + SupervisorJob())
+    private val scope = run {
+        val thread = context[CoroutineThreadLogContext]?.data?.clone()
+        val bridge = thread?.let(::CoroutineThreadLogContext) ?: CoroutineThreadLogContext(context = null)
+        CoroutineScope(context.minusKey(Job) + SupervisorJob() + this.logContext.asCoroutineLogContext(bridge))
+    }
     private val dispatcher = context[ContinuationInterceptor] ?: Dispatchers.Default
     private val registry = HookRegistry()
     private val koinApplication = KoinApplication.init().apply {
@@ -65,6 +81,9 @@ class Application(
 
     val status: ApplicationStatus get() = lock.withLock { currentStatus }
     val koin: Koin get() = koinApplication.koin
+
+    val coroutineContext: CoroutineContext get() = scope.coroutineContext
+
     val attributes = Attributes()
 
     fun requestStart() {
@@ -90,7 +109,12 @@ class Application(
             if (cause != null) record(cause)
             if (previous == ApplicationStatus.STOPPING) return
             val why = reason ?: cause?.let { "${it::class.simpleName}: ${it.message}" }
-            logger.info("Application $name: stop requested" + if (why == null) "" else ": $why")
+            logger.info {
+                context = GlobalLogContext + logContext
+                context("status" to previous.name)
+
+                "Application $name: stop requested" + if (why == null) "" else ": $why"
+            }
             transition(ApplicationStatus.STOPPING)
             previous to startJob
         }
@@ -108,13 +132,17 @@ class Application(
     private suspend fun runStartup() {
         try {
             try {
-                logger.timed("Instance creation") {
+                logger.timedInCoroutine("Instance creation") {
                     koin.createEagerInstances()
                     koin.runHookBlocks()
                 }
             } catch (e: Throwable) {
                 if (e !is CancellationException) {
-                    logger.error("Application $name: creating instances failed", exception = unwrapCreationFailure(e))
+                    logger.error {
+                        withCoroutine()
+                        exception(unwrapCreationFailure(e))
+                        "Application $name: creating instances failed"
+                    }
                 }
                 throw e
             }
@@ -154,7 +182,11 @@ class Application(
             try {
                 koinApplication.close()
             } catch (e: Throwable) {
-                logger.error("Closing Koin failed", exception = e)
+                logger.error {
+                    withCoroutine()
+                    exception(e)
+                    "Closing Koin failed"
+                }
                 record(e)
             }
         } finally {
@@ -162,7 +194,10 @@ class Application(
         }
     }
 
-    private suspend fun runPhase(phase: HookPhase) = logger.timed("$phase hooks") { registry.run(phase) }
+    private suspend fun runPhase(phase: HookPhase, onFailure: (Throwable) -> Unit = {}) =
+        withLogContext("phase" to phase.name) {
+            logger.timedInCoroutine("$phase hooks") { registry.run(phase, onFailure) }
+        }
 
     private suspend fun runShutdownPhases() = coroutineScope {
         val current = AtomicReference(HookPhase.RequestStop)
@@ -170,15 +205,18 @@ class Application(
         // 종료 절차의 timeout보다 늦지 않도록 UNDISPATCHED로 시작한다.
         val watchdog = launch(start = CoroutineStart.UNDISPATCHED) {
             delay(shutdownTimeout)
-            logger.error(
-                "Shutdown exceeded $shutdownTimeout during ${current.get()}; " +
-                    "waiting for its hook to honour cancellation",
-            )
+            val phase = current.get()
+            logger.error {
+                withCoroutine()
+                context("phase", phase.name)
+                "Shutdown exceeded $shutdownTimeout during $phase; " +
+                    "waiting for its hook to honour cancellation"
+            }
         }
         val completed = withTimeoutOrNull(shutdownTimeout) {
             for (phase in listOf(HookPhase.RequestStop, HookPhase.Stop, HookPhase.Release)) {
                 current.set(phase)
-                logger.timed("$phase hooks") { registry.run(phase) { record(it) } }
+                runPhase(phase, ::record)
             }
         }
         if (completed == null) {
@@ -221,7 +259,12 @@ class Application(
 
     /** [lock]을 잡은 상태에서만 호출해야함 */
     private fun transition(to: ApplicationStatus) {
-        logger.info("Application $name: $currentStatus -> $to after ${inStatus.lap()}")
+        logger.info {
+            context = GlobalLogContext + logContext
+            context("fromStatus" to currentStatus.name, "toStatus" to to.name)
+
+            "Application $name: $currentStatus -> $to after ${inStatus.lap()}"
+        }
         currentStatus = to
     }
 }

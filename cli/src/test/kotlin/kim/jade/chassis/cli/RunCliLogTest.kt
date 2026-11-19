@@ -5,8 +5,16 @@ import com.github.ajalt.clikt.parameters.arguments.argument
 import kim.jade.chassis.Application
 import kim.jade.chassis.cli.testing.captureCli
 import kim.jade.chassis.hook.onStart
+import kim.jade.chassis.hook.onStop
 import kim.jade.kotlinx.logger.LogLevel
+import kim.jade.kotlinx.logger.LogRecord
 import kim.jade.kotlinx.logger.Logger
+import kim.jade.kotlinx.logger.context.CoroutineThreadLogContext
+import kim.jade.kotlinx.logger.context.LogContext
+import kim.jade.kotlinx.logger.context.MutableLogContext
+import kim.jade.kotlinx.logger.context.ThreadLogContext
+import kim.jade.kotlinx.logger.context.currentCoroutineLogContext
+import kim.jade.kotlinx.logger.pipeline.SinkPipe
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
@@ -17,6 +25,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.koin.core.module.Module
 import org.koin.dsl.module
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.exists
 import kotlin.io.path.readText
@@ -60,6 +69,77 @@ class RunCliLogTest {
     }
 
     private fun commands() = listOf(Say(calls), Fail())
+
+    @Test fun `the command context is available during the invocation and discarded for shutdown and the next CLI`() = runTest {
+        val records = CopyOnWriteArrayList<LogRecord>()
+        val pipeline = Logger.defaultPipeline
+        pipeline.install(SinkPipe { records += it }, 0)
+        val hooks = module {
+            onStop {
+                logger.info {
+                    withCoroutine()
+                    "CLI cleanup"
+                }
+            }
+        }
+        try {
+            for (name in listOf("first", "second")) {
+                val command = object : CoreSuspendingCliktCommand(name) {
+                    override suspend fun run() {
+                        if (name == "first") {
+                            currentCoroutineLogContext()["local"] = name
+                            ThreadLogContext["threadLocal"] = name
+                        }
+                        logger.info("sync $name")
+                        logger.info {
+                            withCoroutine()
+                            "run $name"
+                        }
+                    }
+                }
+                val result = captureCli {
+                    runCli("tool", arrayOf(name), listOf(command)) {
+                        Application(
+                            listOf(hooks),
+                            name = "tool",
+                            context = StandardTestDispatcher(testScheduler) +
+                                CoroutineThreadLogContext(MutableLogContext("appThread" to name)),
+                            logContext = LogContext("invocation" to name),
+                        )
+                    }
+                }
+                assertEquals(0, result.code)
+            }
+        } finally {
+            pipeline.uninstall(SinkPipe)
+        }
+
+        for (name in listOf("first", "second")) {
+            val context = records.single { it.body == "run $name" }.context
+            assertEquals("tool", context["application"])
+            assertEquals(name, context["invocation"])
+            assertEquals(name, context["command"])
+            assertNull(context["hook"])
+            val thread = records.single { it.body == "sync $name" }.context
+            assertEquals(name, thread["command"])
+            assertEquals(name, thread["invocation"])
+            assertEquals(name, thread["appThread"])
+            assertNull(thread["hook"])
+            assertEquals(name.takeIf { it == "first" }, thread["local"])
+        }
+        val cleanup = records.filter { it.body == "CLI cleanup" }
+        assertEquals(listOf("first", "second"), cleanup.map { it.context["invocation"] })
+        cleanup.forEach {
+            assertNull(it.context["command"])
+            assertNull(it.context["local"])
+            assertNull(it.context["threadLocal"])
+        }
+        assertEquals("first", records.single { it.body == "run first" }.context["local"])
+        assertNull(records.single { it.body == "run second" }.context["local"])
+        assertEquals("first", records.single { it.body == "sync first" }.context["threadLocal"])
+        assertNull(records.single { it.body == "sync second" }.context["threadLocal"])
+        records.filter { it.body.startsWith("Application tool:") }.forEach { assertNull(it.context["command"]) }
+    }
 
     @Test fun `without --log info logs are dropped`() = runTest {
         val result = captureCli { runCli("tool", arrayOf("say", "hi"), commands()) { app(logged()) } }
