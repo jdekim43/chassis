@@ -81,12 +81,11 @@ class WorkerTest {
         try {
             app.allowOverride(false)
             app.modules(recording, stoppable)
-            val recordingWorker = app.koin.get<Recording>(named<Recording>())
-            val stoppableWorker = app.koin.get<Stoppable>(named<Stoppable>())
+            val recordingWorker = app.koin.get<Recording>()
+            val stoppableWorker = app.koin.get<Stoppable>()
             val workers = app.koin.getAll<Worker>()
             assertEquals(2, workers.size)
             assertEquals(setOf(recordingWorker, stoppableWorker), workers.toSet())
-            assertSame(recordingWorker, app.koin.get<Worker>(named<Recording>()))
         } finally {
             app.close()
         }
@@ -272,15 +271,18 @@ class WorkerTest {
         assertEquals(listOf("run", "worker end", "dependency stop", "dependency release"), calls)
     }
 
-    @Test fun `two workers of one type are told apart by qualifier`() = runTest {
+    @Test fun `default and explicitly qualified workers of one type both run`() = runTest {
         val first = mutableListOf<String>()
         val second = mutableListOf<String>()
         val app = application(module {
-            worker(named("first")) { Recording(first) {} }
-            worker(named("second")) { Recording(second) {} }
+            worker { Recording(first) {} }
+            worker(named<Recording>()) { Recording(second) {} }
         })
         app.start()
         advanceUntilIdle()
+        assertSame(first, app.koin.get<Recording>().calls)
+        assertSame(second, app.koin.get<Recording>(named<Recording>()).calls)
+        assertSame(app.koin.get<Recording>(named<Recording>()), app.koin.get<Worker>(named<Recording>()))
         assertEquals(listOf("run"), first)
         assertEquals(listOf("run"), second)
         app.stop()

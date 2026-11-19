@@ -224,9 +224,10 @@ val polling = module {
 }
 ```
 
-- By default, `worker { Poller(get()) }` uses `named<Poller>()` for both the concrete type and its `Worker`
-  binding. Use `get<Poller>(named<Poller>())` for direct lookup. When registering multiple workers of the same
-  type, give each registration a distinct qualifier, such as `worker(named("primary")) { Poller(get()) }`.
+- Resolve a default registration such as `worker { Poller(get()) }` with `get<Poller>()`. The application
+  discovers the same instance through `getAll<Worker>()`. For additional registrations of the same type,
+  use distinct qualifiers such as `worker(named("secondary")) { Poller(get()) }` and resolve them with
+  `get<Poller>(named("secondary"))`.
 - A worker that fails stops the application with that failure.
 - Workers inherit the application coroutine context, including its dispatcher. Set `WorkerOptions.context` to
   override individual elements, such as the dispatcher. The application owns the worker scope's job.
